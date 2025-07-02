@@ -18,8 +18,6 @@
 - **🖼️ 多模态图像支持**：支持图像信息
 - **📦 开箱即用**：Docker 一键部署，配置简单
 
-<img src="images/image-20250702152753273.png" alt="image-20250702152753273" style="zoom:50%;" /
-
 <img src="images/PixPin_2025-07-02_15-28-37.gif" alt="PixPin_2025-07-02_15-28-37" style="zoom: 33%;" />
 
 <img src="images/image-20250702152104103.png" alt="image-20250702152104103" style="zoom:65%;" />
@@ -29,7 +27,7 @@
 
 ### 1. 克隆项目
 ```bash
-git clone <repository-url>
+git clone https://github.com/oDaiSuno/kodu2api.git
 cd kodu2api
 ```
 
@@ -199,4 +197,5 @@ httpx.AsyncClient(
 
 **如果这个项目对您有帮助，请考虑给个 ⭐ Star！**
 
+[![Star History Chart](https://api.star-history.com/svg?repos=oDaiSuno/kodu2api&type=Date)](https://www.star-history.com/#oDaiSuno/kodu2api&Date)
 </div> 
