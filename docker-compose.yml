@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  kodu2api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./kodu.json:/app/kodu.json:ro
+      - ./client_api_keys.json:/app/client_api_keys.json:ro
+      - ./models.json:/app/models.json:ro
+
+    environment:
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+    restart: unless-stopped
