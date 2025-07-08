@@ -46,6 +46,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
+    tools: Optional[List[Dict[str, Any]]] = None
 
 
 class ModelInfo(BaseModel):
@@ -181,6 +182,358 @@ def get_next_kodu_key() -> Optional[KoduApiKey]:
     return key
 
 
+async def unified_kodu_api_call(anthropic_request: AnthropicRequest) -> httpx.Response:
+    """Unified function to call Kodu API with Anthropic format and retry logic"""
+    last_exception = None
+
+    for attempt in range(MAX_KEY_RETRIES):
+        kodu_key = get_next_kodu_key()
+        if not kodu_key:
+            raise HTTPException(
+                status_code=503,
+                detail="No valid Kodu API keys available. Please check your configuration.",
+            )
+
+        print(f"Attempt {attempt + 1}/{MAX_KEY_RETRIES} using key: {kodu_key['key'][:8]}...")
+
+        try:
+            payload = {
+                "model": anthropic_request.model,
+                "max_tokens": anthropic_request.max_tokens,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in anthropic_request.messages],
+                "temperature": anthropic_request.temperature or 1.0,
+            }
+
+            if anthropic_request.system:
+                payload["system"] = anthropic_request.system
+
+            if anthropic_request.tools:
+                payload["tools"] = anthropic_request.tools
+
+            if anthropic_request.thinking:
+                payload["thinking"] = anthropic_request.thinking
+
+            headers = {
+                "User-Agent": "anthropic-sdk-python/0.25.0",
+                "Content-Type": "application/json",
+                "x-api-key": kodu_key["key"],
+            }
+
+            req = http_client.build_request(
+                "POST",
+                "https://www.kodu.ai/api/inference-stream",
+                json=payload,
+                headers=headers,
+            )
+            response = await http_client.send(req, stream=True)
+            response.raise_for_status()
+            return response
+
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            error_detail = await e.response.atext()
+
+            print(f"Kodu API error ({status_code}): {error_detail}")
+            last_exception = e
+
+            if status_code in [401, 403]:
+                for k in KODU_API_KEYS:
+                    if k["key"] == kodu_key["key"]:
+                        k["is_valid"] = False
+                continue
+            elif status_code in [429, 500, 502, 503, 504]:
+                continue
+            else:
+                raise HTTPException(status_code=status_code, detail=error_detail)
+
+        except Exception as e:
+            print(f"Request error: {e}")
+            last_exception = e
+            continue
+
+    final_error = "All attempts to contact Kodu API failed."
+    final_status = 503
+
+    if isinstance(last_exception, httpx.HTTPStatusError):
+        final_status = last_exception.response.status_code
+        final_error = await last_exception.response.atext()
+
+    raise HTTPException(status_code=final_status, detail=final_error)
+
+
+def openai_to_anthropic_request(openai_request: ChatCompletionRequest) -> AnthropicRequest:
+    """Convert OpenAI chat completion request to Anthropic format"""
+    is_thinking_model = "thinking" in openai_request.model
+    
+    processed_messages = []
+    system_content = None
+    
+    for msg in openai_request.messages:
+        if msg.role == "system":
+            system_content = msg.content
+            continue
+            
+        if isinstance(msg.content, list):
+            content_list = []
+            for item in msg.content:
+                if item.get("type") == "text":
+                    content_list.append({
+                        "type": "text",
+                        "text": item.get("text", ""),
+                    })
+                elif item.get("type") == "image_url":
+                    image_data = item["image_url"]["url"]
+                    if "," in image_data:
+                        image_data = image_data.split(",", 1)[1]
+                    content_list.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_data,
+                        },
+                    })
+            processed_messages.append(AnthropicMessage(role=msg.role, content=content_list))
+        else:
+            processed_messages.append(AnthropicMessage(
+                role=msg.role,
+                content=[{"type": "text", "text": msg.content}]
+            ))
+    
+    system_prompt = [{"type": "text", "text": SYSTEM_PROMPT}]
+    if system_content:
+        system_prompt[0]["text"] += "\n New system prompt:  \n" + system_content
+    
+    anthropic_tools = None
+    if openai_request.tools:
+        anthropic_tools = []
+        for tool in openai_request.tools:
+            if tool.get("type") == "function":
+                func = tool.get("function", {})
+                anthropic_tools.append({
+                    "name": func.get("name"),
+                    "description": func.get("description"),
+                    "input_schema": func.get("parameters", {})
+                })
+    
+    anthropic_req = AnthropicRequest(
+        model=openai_request.model,
+        messages=processed_messages,
+        max_tokens=openai_request.max_tokens or 64000,
+        temperature=1.0 if is_thinking_model else (openai_request.temperature or 1.0),
+        system=system_prompt,
+        stream=openai_request.stream,
+        tools=anthropic_tools
+    )
+    
+    if is_thinking_model:
+        anthropic_req.thinking = {"type": "enabled", "budget_tokens": 32000}
+    
+    return anthropic_req
+
+
+def anthropic_response_to_openai(anthropic_resp: AnthropicResponse, model: str) -> ChatCompletionResponse:
+    """Convert Anthropic response to OpenAI format"""
+    content = ""
+    tool_calls = []
+    finish_reason = "stop"
+    
+    for item in anthropic_resp.content:
+        if item.get("type") == "text":
+            content = item.get("text", "")
+        elif item.get("type") == "tool_use":
+            tool_calls.append({
+                "id": item.get("id"),
+                "type": "function",
+                "function": {
+                    "name": item.get("name"),
+                    "arguments": json.dumps(item.get("input", {}))
+                }
+            })
+    
+    if tool_calls:
+        finish_reason = "tool_calls"
+    elif anthropic_resp.stop_reason == "max_tokens":
+        finish_reason = "length"
+    
+    message = ChatMessage(
+        role="assistant",
+        content=content
+    )
+    
+    choice = ChatCompletionChoice(
+        message=message,
+        finish_reason=finish_reason
+    )
+    
+    if tool_calls:
+        # Add tool_calls to the message dict (pydantic doesn't have this field by default)
+        choice.message.__dict__["tool_calls"] = tool_calls
+    
+    return ChatCompletionResponse(
+        model=model,
+        choices=[choice]
+    )
+
+
+async def anthropic_stream_to_openai_stream(anthropic_stream, model: str):
+    """Convert Anthropic streaming response to OpenAI format"""
+    stream_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created_time = int(time.time())
+    
+    # Send initial role delta
+    yield f"data: {StreamResponse(id=stream_id, created=created_time, model=model, choices=[StreamChoice(delta={'role': 'assistant'})]).json()}\n\n"
+    
+    try:
+        # Buffer to accumulate current line
+        current_line = ""
+        event_type = None
+        # Track current tool calls for state management
+        current_tool_calls = {}  # {index: {"id": "tool_id", "name": "tool_name"}}
+        # Accumulate tool arguments for complete function calls
+        tool_arguments_accumulator = {}  # {index: "accumulated_arguments_string"}
+        
+        async for chunk in anthropic_stream:
+            # Accumulate chunks into lines
+            current_line += chunk
+            
+            # Process complete lines
+            while "\n" in current_line:
+                line, current_line = current_line.split("\n", 1)
+                line = line.strip()
+                
+                if not line:
+                    continue
+                    
+                if line.startswith("event: "):
+                    event_type = line[7:].strip()
+                elif line.startswith("data: ") and event_type:
+                    data_str = line[6:].strip()
+                    
+                    # Skip empty data
+                    if not data_str or data_str == "{}":
+                        continue
+                    
+                    try:
+                        data = json.loads(data_str)
+                        
+                        # Handle content_block_delta events
+                        if event_type == "content_block_delta":
+                            delta = data.get("delta", {})
+                            
+                            # Handle text delta
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    openai_response = StreamResponse(
+                                        id=stream_id,
+                                        created=created_time,
+                                        model=model,
+                                        choices=[StreamChoice(delta={"content": text})]
+                                    )
+                                    yield f"data: {openai_response.json()}\n\n"
+                            
+                            # Handle thinking delta (for reasoning models)
+                            elif delta.get("type") == "thinking_delta":
+                                thinking = delta.get("thinking", "")
+                                if thinking:
+                                    openai_response = StreamResponse(
+                                        id=stream_id,
+                                        created=created_time,
+                                        model=model,
+                                        choices=[StreamChoice(delta={"reasoning_content": thinking})]
+                                    )
+                                    yield f"data: {openai_response.json()}\n\n"
+                            
+                            # Handle tool use input delta - accumulate arguments
+                            elif delta.get("type") == "input_json_delta":
+                                partial_json = delta.get("partial_json", "")
+                                tool_index = data.get("index", 0)
+                                
+                                # Accumulate tool arguments instead of sending immediately
+                                if partial_json and tool_index in current_tool_calls:
+                                    if tool_index not in tool_arguments_accumulator:
+                                        tool_arguments_accumulator[tool_index] = ""
+                                    tool_arguments_accumulator[tool_index] += partial_json
+                        
+                        # Handle content_block_start events (for tool calls)
+                        elif event_type == "content_block_start":
+                            content_block = data.get("content_block", {})
+                            if content_block.get("type") == "tool_use":
+                                tool_id = content_block.get("id", "")
+                                tool_name = content_block.get("name", "")
+                                tool_index = data.get("index", 0)
+                                
+                                # Record tool call state for later use - don't send immediately
+                                current_tool_calls[tool_index] = {
+                                    "id": tool_id,
+                                    "name": tool_name
+                                }
+                                # Initialize arguments accumulator
+                                tool_arguments_accumulator[tool_index] = ""
+                        
+                        # Handle content_block_stop events (for tool calls completion)
+                        elif event_type == "content_block_stop":
+                            tool_index = data.get("index", 0)
+                            
+                            # Send complete tool call when block stops
+                            if tool_index in current_tool_calls and tool_index in tool_arguments_accumulator:
+                                tool_info = current_tool_calls[tool_index]
+                                complete_arguments = tool_arguments_accumulator[tool_index]
+                                
+                                # Send complete tool call like exp.py pattern
+                                openai_response = StreamResponse(
+                                    id=stream_id,
+                                    created=created_time,
+                                    model=model,
+                                    choices=[StreamChoice(delta={
+                                        "tool_calls": [{
+                                            "index": tool_index,
+                                            "id": tool_info["id"],
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_info["name"],
+                                                "arguments": complete_arguments
+                                            }
+                                        }]
+                                    })]
+                                )
+                                yield f"data: {openai_response.json()}\n\n"
+                        
+                        # Handle message_stop event
+                        elif event_type == "message_stop":
+                            # Determine finish reason based on whether we had tool calls
+                            finish_reason = "tool_calls" if current_tool_calls else "stop"
+                            
+                            # Send final response
+                            openai_response = StreamResponse(
+                                id=stream_id,
+                                created=created_time,
+                                model=model,
+                                choices=[StreamChoice(delta={}, finish_reason=finish_reason)]
+                            )
+                            yield f"data: {openai_response.json()}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        
+                        # Handle error events
+                        elif event_type == "error":
+                            error_msg = data.get("error", {}).get("message", "Unknown error")
+                            yield f"data: {json.dumps({'error': {'message': error_msg}})}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                            
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    # Reset event type after processing data
+                    event_type = None
+    
+    except Exception as e:
+        yield f"data: {json.dumps({'error': {'message': str(e)}})}\n\n"
+        yield "data: [DONE]\n\n"
+
+
 async def authenticate_client(
     auth: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
@@ -289,295 +642,77 @@ async def anthropic_messages(request: AnthropicRequest, http_request: Request):
             status_code=400, detail="No messages provided in the request."
         )
 
-    last_exception = None
-
-    for attempt in range(MAX_KEY_RETRIES):
-        kodu_key = get_next_kodu_key()
-        if not kodu_key:
-            raise HTTPException(
-                status_code=503,
-                detail="No valid Kodu API keys available. Please check your configuration.",
+    system_prompt = [{"type": "text", "text": SYSTEM_PROMPT}]
+    if request.system:
+        if isinstance(request.system, str):
+            system_prompt[0]["text"] += "\n New system prompt:  \n" + request.system
+        else:
+            system_prompt[0]["text"] += "\n New system prompt:  \n" + request.system[0]["text"]
+    
+    request.system = system_prompt
+    
+    try:
+        response = await unified_kodu_api_call(request)
+        
+        if request.stream:
+            return StreamingResponse(
+                anthropic_stream_generator(response, request.model),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
+                background=BackgroundTask(response.aclose),
             )
-
-        print(f"Attempt {attempt + 1}/{MAX_KEY_RETRIES} using key: {kodu_key['key'][:8]}...")
-
-        try:
-            payload = {
-                "model": request.model,
-                "max_tokens": request.max_tokens,
-                "messages": [{"role": msg.role, "content": msg.content} for msg in request.messages],
-                "temperature": request.temperature or 1.0,
-                "system": [{"type": "text", "text": SYSTEM_PROMPT}]
-            }
-
-            if request.system:
-                if isinstance(request.system, str):
-                    payload["system"] = [{"type": "text", "text": SYSTEM_PROMPT + "\n New system prompt:  \n" + request.system}]
-                else:
-                    payload["system"] = [{"type": "text", "text": SYSTEM_PROMPT + "\n New system prompt:  \n" + request.system[0]["text"]}]
-
-            if request.tools:
-                payload["tools"] = request.tools
-
-            
-            if request.thinking:
-                payload["thinking"] = request.thinking
-                payload["temperature"] = 1
-            
-            headers = {
-                "User-Agent": "anthropic-sdk-python/0.25.0",
-                "Content-Type": "application/json",
-                "x-api-key": kodu_key["key"],
-            }
-
-            req = http_client.build_request(
-                "POST",
-                "https://www.kodu.ai/api/inference-stream",
-                json=payload,
-                headers=headers,
-            )
-            response = await http_client.send(req, stream=True)
-            
-            try:
-                response.raise_for_status()
-
-                if request.stream:
-                    return StreamingResponse(
-                        anthropic_stream_generator(response, request.model),
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                        },
-                        background=BackgroundTask(response.aclose),
-                    )
-                else:
-                    return await build_anthropic_response(response, request.model)
-            except Exception:
-                await response.aclose()
-                raise
-
-        except httpx.HTTPStatusError as e:
-            status_code = e.response.status_code
-            error_detail = await e.response.atext()
-
-            print(f"Kodu API error ({status_code}): {error_detail}")
-            last_exception = e
-
-            if status_code in [401, 403]:
-                for k in KODU_API_KEYS:
-                    if k["key"] == kodu_key["key"]:
-                        k["is_valid"] = False
-                continue
-            elif status_code in [429, 500, 502, 503, 504]:
-                continue
-            else:
-                raise HTTPException(status_code=status_code, detail=error_detail)
-
-        except Exception as e:
-            print(f"Request error: {e}")
-            last_exception = e
-            continue
-
-    final_error = "All attempts to contact Kodu API failed."
-    final_status = 503
-
-    if isinstance(last_exception, httpx.HTTPStatusError):
-        final_status = last_exception.response.status_code
-        final_error = await last_exception.response.atext()
-
-    raise HTTPException(status_code=final_status, detail=final_error)
+        else:
+            return await build_anthropic_response(response, request.model)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest, _: None = Depends(authenticate_client)
 ):
-    """Create chat completion using Kodu API backend"""
+    """Create chat completion using Kodu API backend with Anthropic-centric adapter"""
     if not request.messages:
         raise HTTPException(
             status_code=400, detail="No messages provided in the request."
         )
 
-    last_exception = None
-
-    # Retry with different keys
-    for attempt in range(MAX_KEY_RETRIES):
-        kodu_key = get_next_kodu_key()
-        if not kodu_key:
-            raise HTTPException(
-                status_code=503,
-                detail="No valid Kodu API keys available. Please check your configuration.",
+    try:
+        anthropic_request = openai_to_anthropic_request(request)
+        response = await unified_kodu_api_call(anthropic_request)
+        
+        if request.stream:
+            anthropic_stream = anthropic_stream_generator(response, request.model)
+            return StreamingResponse(
+                anthropic_stream_to_openai_stream(anthropic_stream, request.model),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+                background=BackgroundTask(response.aclose),
             )
-
-        print(
-            f"Attempt {attempt + 1}/{MAX_KEY_RETRIES} using key: {kodu_key['key'][:8]}..."
-        )
-
-        try:
-            # Prepare Kodu API request
-            is_thinking_model = "thinking" in request.model
-
-            # Process messages for Kodu format
-            processed_messages = []
-            for msg in request.messages:
-                if isinstance(msg.content, list):  # Handle multi-modal content
-                    content_list = []
-                    for item in msg.content:
-                        if item.get("type") == "text":
-                            content_list.append(
-                                {
-                                    "type": "text",
-                                    "text": item.get("text", ""),
-                                    # "cache_control": {"type": "ephemeral"},
-                                }
-                            )
-                        else:
-                            content_list.append(
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/png",
-                                        "data": item["image_url"]["url"].split(",", 1)[1] if "," in item["image_url"]["url"] else item["image_url"]["url"],
-                                    },
-                                    # "cache_control": {"type": "ephemeral"}
-                                },
-                            )
-                    processed_messages.append(
-                        {"role": msg.role, "content": content_list}
-                    )
-                else:  # Simple text content
-                    processed_messages.append(
-                        {
-                            "role": msg.role,
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": msg.content,
-                                    # "cache_control": {"type": "ephemeral"},
-                                }
-                            ],
-                        }
-                    )
-
-            # Prepare the payload
-            payload = {
-                "model": "claude-3-7-sonnet-20250219",  # Hardcoded as per testChat.py
-                "max_tokens": request.max_tokens or 64000,
-                "messages": processed_messages,
-                "temperature": (
-                    1.0 if is_thinking_model else (request.temperature or 1.0)
-                ),
-            }
-
-            # Add system prompt if present
-            payload["system"] = [
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT
-                    }
-                ]
-            system_messages = [msg for msg in request.messages if msg.role == "system"]
-            if system_messages:
-                payload["system"] = [
-                    {
-                        "type": "text",
-                        "text": payload["system"][0]["text"] + "\n New system prompt:  \n"
-                        + system_messages[0].content,
-                    }
-                ]
-                
-
-            # Add thinking option if using thinking model
-            if is_thinking_model:
-                payload["thinking"] = {"type": "enabled", "budget_tokens": 32000}
-
-            headers = {
-                "User-Agent": "axios/1.7.9",
-                "Connection": "close",
-                "Accept": "application/json, text/plain, */*",
-                # "Accept-Encoding": "gzip, compress, deflate, br",
-                "Content-Type": "application/json",
-                "x-api-key": kodu_key["key"],
-                "continue-generation": "true",
-            }
-
-            req = http_client.build_request(
-                "POST",
-                "https://www.kodu.ai/api/inference-stream",
-                json=payload,
-                headers=headers,
-            )
-            response = await http_client.send(req, stream=True)
+        else:
+            anthropic_response = await build_anthropic_response(response, request.model)
+            return anthropic_response_to_openai(anthropic_response, request.model)
             
-            try:
-                response.raise_for_status()
-
-                if request.stream:
-                    return StreamingResponse(
-                        stream_response_generator(response, request.model),
-                        media_type="text/event-stream",
-                        headers={
-                            "Cache-Control": "no-cache",
-                            "Connection": "keep-alive",
-                            "X-Accel-Buffering": "no",
-                        },
-                        background=BackgroundTask(response.aclose),
-                    )
-                else:
-                    return await build_non_stream_response(response, request.model)
-            except Exception:
-                await response.aclose()
-                raise
-
-        except httpx.HTTPStatusError as e:
-            status_code = e.response.status_code
-            error_detail = await e.response.atext()
-
-            print(f"Kodu API error ({status_code}): {error_detail}")
-            last_exception = e
-
-            if status_code in [401, 403]:
-                # Mark this key as invalid
-                for k in KODU_API_KEYS:
-                    if k["key"] == kodu_key["key"]:
-                        k["is_valid"] = False
-                continue
-            elif status_code in [429, 500, 502, 503, 504]:
-                continue
-            else:
-                # Client error, don't retry
-                if request.stream:
-                    return StreamingResponse(
-                        error_stream_generator(error_detail, status_code),
-                        media_type="text/event-stream",
-                        status_code=status_code,
-                    )
-                else:
-                    raise HTTPException(status_code=status_code, detail=error_detail)
-
-        except Exception as e:
-            print(f"Request error: {e}")
-            last_exception = e
-            continue
-
-    # All retries failed
-    final_error = "All attempts to contact Kodu API failed."
-    final_status = 503
-
-    if isinstance(last_exception, httpx.HTTPStatusError):
-        final_status = last_exception.response.status_code
-        final_error = await last_exception.response.atext()
-
-    if request.stream:
-        return StreamingResponse(
-            error_stream_generator(final_error, final_status),
-            media_type="text/event-stream",
-            status_code=final_status,
-        )
-    else:
-        raise HTTPException(status_code=final_status, detail=final_error)
+    except HTTPException:
+        raise
+    except Exception as e:
+        if request.stream:
+            return StreamingResponse(
+                error_stream_generator(str(e), 500),
+                media_type="text/event-stream",
+                status_code=500,
+            )
+        else:
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 async def stream_response_generator(response, model: str):

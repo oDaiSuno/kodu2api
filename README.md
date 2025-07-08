@@ -10,6 +10,10 @@
 
 > 高性能异步 AI 代理服务，将 Kodu AI 的 Claude 3.7 Sonnet 模型转换为 OpenAI API 格式，支持真正的流式响应和高并发处理。
 
+## 🚀 更新日志 (v2.0.0)
+*   **新增 Anthropic API 兼容**：无缝对接 Anthropic SDK，现已支持 `/v1/messages` 端点。
+
+
 ## ✨ 核心特性
 
 - **⚡ 高并发异步架构**：基于 httpx + FastAPI，支持数千并发连接
